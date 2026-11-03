@@ -82,6 +82,9 @@ pub fn parse_join(status: u16, value: Value) -> Result<JoinData, Error> {
     };
     data.ok_or(Error::MissingRoom)
 }
+/// Cloud 2002 「被控端正在被远控中，无法发起连接」: another controller already has the
+/// device. Re-joining with force_join=true takes over (the official client's 「是否抢占」).
+pub fn is_busy(error: &Error) -> bool { matches!(error, Error::Api(2002, _)) }
 fn parse_share(status: u16, mut body: Value, secrets: &[&str]) -> Result<JoinData, Error> {
     if let Some(Value::String(msg)) = body.get_mut("msg") {
         // A server error must not echo credentials to stderr or the launcher.
@@ -288,6 +291,12 @@ mod tests {
         assert_eq!(retry_delay(&Error::Api(5000,String::new()),5,true),None);
         assert_eq!(retry_delay(&Error::Api(5000,String::new()),0,false),None);
         for error in [Error::Transport,Error::InvalidResponse,Error::AuthenticationExpired] { assert_eq!(retry_delay(&error,0,true),None); }
+    }
+    #[test]
+    fn busy_detects_only_code_2002() {
+        assert!(is_busy(&Error::Api(2002,String::new())));
+        for code in [-1,2001,2006,2007,4042,5000] { assert!(!is_busy(&Error::Api(code,String::new()))); }
+        assert!(!is_busy(&Error::Transport));
     }
 }
 

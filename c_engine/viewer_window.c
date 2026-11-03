@@ -809,3 +809,25 @@ int uu_viewer_ui_confirm_replace(void) {
     }
     int result = replace_result; pthread_mutex_unlock(&init_lock); return result;
 }
+
+/// Cloud 2002 (被控端正在被远控中): the official client's 「是否抢占」/「接管设备」 dialog.
+static int preempt_result;
+static gboolean confirm_preempt(gpointer d) {
+    (void)d;
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE, L("被控端正在被远控中，是否抢占？", "The device is already being controlled. Take over?"));
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog), L("确认后，当前正在控制该设备的连接将断开。", "After confirming, the current connection controlling this device will be disconnected."));
+    gtk_dialog_add_buttons(GTK_DIALOG(dialog), L("取消", "Cancel"), GTK_RESPONSE_CANCEL, L("接管", "Take over"), GTK_RESPONSE_OK, NULL);
+    int accepted = gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK;
+    gtk_widget_destroy(dialog);
+    pthread_mutex_lock(&init_lock); preempt_result = accepted; pthread_cond_signal(&init_cond); pthread_mutex_unlock(&init_lock);
+    return G_SOURCE_REMOVE;
+}
+int uu_viewer_ui_confirm_preempt(void) {
+    pthread_mutex_lock(&init_lock); preempt_result = -1; g_idle_add(confirm_preempt, NULL);
+    while (preempt_result < 0 && !atomic_load(&closed)) {
+        struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec++;
+        pthread_cond_timedwait(&init_cond, &init_lock, &until);
+    }
+    int result = preempt_result; pthread_mutex_unlock(&init_lock); return result;
+}

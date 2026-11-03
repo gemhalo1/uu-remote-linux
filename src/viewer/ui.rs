@@ -12,14 +12,19 @@ extern "C" {
     fn uu_viewer_ui_take_command(out: *mut c_char, len: usize) -> c_int;
     fn uu_viewer_ui_closed() -> c_int;
     fn uu_viewer_ui_confirm_replace() -> c_int;
+    fn uu_viewer_ui_confirm_preempt() -> c_int;
     fn uu_viewer_ui_toast(text: *const c_char);
     fn uu_viewer_ui_set_host(active: c_int);
 }
 fn toast(text: &str) { let t = c(text); unsafe { uu_viewer_ui_toast(t.as_ptr()) } }
+/// The session child's stdin, shared with the command loop (one pipe, rare small writes).
+type CommandPipe = std::sync::Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>;
 
 /// Runs one session child; on failure shows its last error line (log lines start with '[').
-fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::oneshot::Receiver<()>, success: Option<&'static str>) -> tokio::task::JoinHandle<()> {
-    use tokio::io::AsyncBufReadExt;
+/// On a PREEMPT_PROMPT marker it asks the user about the takeover (cloud 2002) and answers
+/// on the child's stdin.
+fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::oneshot::Receiver<()>, success: Option<&'static str>, commands: Option<CommandPipe>) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let stderr = child.stderr.take();
     tokio::spawn(async move {
         let mut last = String::new();
@@ -32,7 +37,19 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
                 }
                 status = child.wait() => break status,
                 line = async { match lines.as_mut() { Some(l) => l.next_line().await, None => std::future::pending().await } } => match line {
-                    Ok(Some(l)) => { if l.starts_with("DECKPAD_"){eprintln!("{l}");} else if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); } }
+                    Ok(Some(l)) => {
+                        if l.starts_with("DECKPAD_") { eprintln!("{l}"); }
+                        else if l == "PREEMPT_PROMPT" {
+                            // Ask the user about the takeover; the child waits for the answer on its stdin.
+                            let accepted = unsafe { uu_viewer_ui_confirm_preempt() } == 1;
+                            if let Some(stdin) = &commands {
+                                let mut guard = stdin.lock().await;
+                                let _ = guard.write_all(if accepted { b"y\n" } else { b"n\n" }).await;
+                                let _ = guard.flush().await;
+                            }
+                        }
+                        else if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); }
+                    }
                     _ => lines = None,
                 },
             }
@@ -41,7 +58,7 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
         let _ = tokio::time::timeout(Duration::from_millis(200), async {
             if let Some(lines) = lines.as_mut() {
                 while let Ok(Some(l)) = lines.next_line().await {
-                    if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); }
+                    if l != "PREEMPT_PROMPT" && !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); }
                 }
             }
         }).await;
@@ -57,7 +74,7 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
     })
 }
 
-struct Running { cancel:tokio::sync::oneshot::Sender<()>, task:tokio::task::JoinHandle<()>, input:Option<tokio::process::ChildStdin> }
+struct Running { cancel:tokio::sync::oneshot::Sender<()>, task:tokio::task::JoinHandle<()>, input:Option<CommandPipe> }
 impl Running { async fn stop(self){let _=self.cancel.send(());let _=self.task.await;} }
 async fn replace(sessions:&mut std::collections::HashMap<String,Running>,id:&str)->bool{
     if sessions.get(id).is_some_and(|s|!s.task.is_finished()) && unsafe{uu_viewer_ui_confirm_replace()}!=1{return false}
@@ -191,30 +208,35 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                     if *kind=="watch" {command.arg("--view-only");}
                     match command.env("UU_VIEWER_COMMANDS","1").stdin(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn() {
-                        Ok(mut child) => { let input=child.stdin.take();let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,None);sessions.insert((*id).into(),Running{cancel,task,input}); }
+                        Ok(mut child) => {
+                            let input=child.stdin.take().map(|s|std::sync::Arc::new(tokio::sync::Mutex::new(s)));
+                            let (cancel,rx)=tokio::sync::oneshot::channel();
+                            let task=watch_session(child,rx,None,input.clone());
+                            sessions.insert((*id).into(),Running{cancel,task,input});
+                        }
                         Err(_) => toast(crate::i18n::s("连接失败：无法启动会话进程","Connection failed: cannot start the session process")),
                     }
                 }
                 ["assist", id, code] => {
                     match super::assist::command(&exe, id).spawn() {
                         Ok(mut child) => match super::assist::send_code(&mut child, code).await {
-                            Ok(()) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,None);sessions.insert(format!("assist:{id}"),Running{cancel,task,input:None}); }
+                            Ok(()) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,None,None);sessions.insert(format!("assist:{id}"),Running{cancel,task,input:None}); }
                             Err(reason) => toast(&crate::tr!("连接失败：{reason}","Connection failed: {reason}")),
                         },
                         Err(_) => toast(crate::i18n::s("连接失败：无法启动协助会话进程","Connection failed: cannot start the assistance session")),
                     }
                 }
                 ["connect", id, kind @ ("file" | "portmap" | "terminal")] => {
-                    if *kind=="file" {if let Some(s)=sessions.get_mut(*id){if let Some(input)=s.input.as_mut(){
+                    if *kind=="file" {if let Some(s)=sessions.get(*id){if let Some(input)=s.input.as_ref(){
                         use tokio::io::AsyncWriteExt;
-                        if input.write_all(b"files\n").await.is_err(){toast(crate::i18n::s("桌面会话命令发送失败，请重试","Could not send the command to the desktop session, try again"))}continue
+                        if input.lock().await.write_all(b"files\n").await.is_err(){toast(crate::i18n::s("桌面会话命令发送失败，请重试","Could not send the command to the desktop session, try again"))}continue
                     }}}
                     if !replace(&mut sessions,id).await{continue}
                     let name = names.get(*id).cloned().unwrap_or_else(|| crate::i18n::s("远端设备","Remote device").into());
                     let tool = if *kind == "file" { "files-ui" } else if *kind == "terminal" { "terminal-ui" } else { "portmap-ui" };
                     match tokio::process::Command::new(&exe).args([tool, id, &name])
                         .stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn() {
-                        Ok(child) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,None);sessions.insert((*id).into(),Running{cancel,task,input:None}); }
+                        Ok(child) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,None,None);sessions.insert((*id).into(),Running{cancel,task,input:None}); }
                         Err(_) => toast(crate::i18n::s("连接失败：无法启动工具进程","Connection failed: cannot start the tool process")),
                     }
                 }
@@ -222,7 +244,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                     if !replace(&mut sessions,id).await{continue}
                     match tokio::process::Command::new(&exe).args(["power", id, kind])
                         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn() {
-                        Ok(child) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,Some(crate::i18n::s("电源指令已发送，未确认远端执行结果","Power command sent; the result on the remote device is not confirmed")));sessions.insert((*id).into(),Running{cancel,task,input:None}); }
+                        Ok(child) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,Some(crate::i18n::s("电源指令已发送，未确认远端执行结果","Power command sent; the result on the remote device is not confirmed")),None);sessions.insert((*id).into(),Running{cancel,task,input:None}); }
                         Err(_) => toast(crate::i18n::s("电源指令失败：无法启动会话进程","Power command failed: cannot start the session process")),
                     }
                 }

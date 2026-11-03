@@ -104,7 +104,15 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     let contacting=i18n::s("正在连接远端设备…","Contacting the remote device…");
     let room=wait!(contacting,async{match code {
         Some(code)=>api.join_share(&args[1],&code).await,
-        None=>api.join(&args[1],force,true).await,
+        // Cloud 2002: another controller already has the device. The official client shows a
+        // take-over (是否抢占/接管设备) dialog and re-joins with force_join=true; mirror that
+        // instead of failing (the join request mirrors the official Windows client, which
+        // sends the force_join field).
+        None=>match api.join(&args[1],force,true).await {
+            Ok(room)=>Ok(room),
+            Err(error) if !force && viewer::api::is_busy(&error) && ask_takeover().await=>api.join(&args[1],true,false).await,
+            Err(error)=>Err(error),
+        },
     }}).map_err(|e|e.to_string())?;
     let target_mac=if shape.capture_type==1 {wait!(contacting,api.target_is_mac(&room,account_connection.then_some(args[1].as_str())))} else {Err(viewer::api::Error::UnknownKeyboardPlatform)};
     #[cfg(feature="viewer-sdl")]
@@ -123,6 +131,38 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     #[cfg(not(feature="viewer-sdl"))]
     let result=session.run().await;
     session.close().await;result
+}
+/// Which way a take-over question reaches the user (cloud 2002 「被控端正在被远控中」).
+#[derive(Debug,PartialEq,Eq)]
+enum TakeoverMode { Launcher, Terminal, None }
+fn takeover_mode()->TakeoverMode{
+    // As a launcher child the GTK dialog is shown by the launcher, which answers on our stdin.
+    if std::env::var("UU_VIEWER_COMMANDS").as_deref()==Ok("1") { return TakeoverMode::Launcher; }
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() { return TakeoverMode::Terminal; }
+    TakeoverMode::None
+}
+/// Ask whether the user accepts the takeover before re-joining with force_join=true
+/// (the official client's 「是否抢占」/「接管设备」 dialog).
+async fn ask_takeover()->bool{
+    let yes=|line:String|matches!(line.trim().to_ascii_lowercase().as_str(),"y"|"yes"|"true");
+    match takeover_mode() {
+        TakeoverMode::Launcher => {
+            eprintln!("PREEMPT_PROMPT");
+            tokio::time::timeout(Duration::from_secs(300),read_stdin_line()).await.is_ok_and(|r|yes(r.unwrap_or_default()))
+        }
+        TakeoverMode::Terminal => {
+            eprintln!("{}",i18n::s("被控端正在被远控中，是否抢占接管？[y/N]","The device is already being controlled; take over? [y/N]"));
+            read_stdin_line().await.is_ok_and(|line|yes(line))
+        }
+        TakeoverMode::None => false,
+    }
+}
+/// One stdin line on a worker thread; Err when the reader is closed (launcher quit) or dies.
+async fn read_stdin_line()->std::io::Result<String>{
+    use std::io::BufRead;
+    tokio::task::spawn_blocking(||std::io::stdin().lock().lines().next())
+        .await.ok().flatten().unwrap_or_else(||Err(std::io::Error::new(std::io::ErrorKind::Other,"stdin closed")))
 }
 async fn type_command(args:&[String])->Result<(),String>{
     // type DEVICE [--delay-ms MS] [--omit-last N] [--snapshot PATH] [--dry-run] [--new-session]
@@ -244,6 +284,27 @@ mod cli_tests {
         assert!(!err.contains("SECRET"));
         std::env::remove_var("UU_INPUT_ENV");
         std::env::remove_var("UU_TYPE_SENTINEL_ENV");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn takeover_prompt_paths_follow_the_ui_context() {
+        let _g = viewer::secure_input::ENV_LOCK.lock().unwrap();
+        // Point stdin at a closed pipe end: not a TTY, and a read returns EOF.
+        let saved = unsafe { libc::dup(0) };
+        let mut pipe = [0; 2];
+        unsafe { libc::pipe(pipe.as_mut_ptr()) };
+        unsafe { libc::dup2(pipe[1], 0) };
+        unsafe { libc::close(pipe[0]) };
+        std::env::remove_var("UU_VIEWER_COMMANDS");
+        assert_eq!(takeover_mode(), TakeoverMode::None);
+        assert!(!ask_takeover().await);
+        std::env::set_var("UU_VIEWER_COMMANDS", "1");
+        assert_eq!(takeover_mode(), TakeoverMode::Launcher);
+        // The launcher's stdin is already closed: the prompt is declined, not hung.
+        assert!(!ask_takeover().await);
+        std::env::remove_var("UU_VIEWER_COMMANDS");
+        unsafe { libc::dup2(saved, 0) };
+        unsafe { libc::close(saved) };
     }
     #[tokio::test]
     async fn login_reuses_companion_subcommand_with_a_local_process_mock() {
