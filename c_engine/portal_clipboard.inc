@@ -81,7 +81,7 @@ static void selection_transfer(GDBusConnection *bus,const gchar *sender,const gc
     uint8_t *copy=NULL; size_t length=0;
     pthread_mutex_lock(&p->lock);
     if (text_mime(mime) && p->clipboard_text) {
-        length=p->clipboard_length; copy=g_memdup2(p->clipboard_text,length+1);
+        length=p->clipboard_length; copy=g_memdup(p->clipboard_text,length+1);
     }
     pthread_mutex_unlock(&p->lock);
     int success=0;
