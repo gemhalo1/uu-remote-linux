@@ -240,8 +240,9 @@ impl UUAuthClient {
 
         let mut param_map = BTreeMap::new();
         param_map.insert("x-param-plat".into(), "1".into());
-        param_map.insert("x-param-vn".into(), "4.42.0.2770".into());
-        param_map.insert("x-param-vc".into(), "2770".into());
+        // Official Windows build (UURemote_Setup_4.45.0.4318_..._gwqd.exe, 2026-10-29).
+        param_map.insert("x-param-vn".into(), "4.45.0.4318".into());
+        param_map.insert("x-param-vc".into(), "4318".into());
         param_map.insert("x-param-pkgn".into(), "com.netease.gameviewer".into());
         param_map.insert("x-param-chn".into(), "gwqd".into());
         param_map.insert("x-param-lang".into(), "zh-CN".into());
@@ -261,7 +262,7 @@ impl UUAuthClient {
         headers.insert("Accept", HeaderValue::from_static("application/json"));
         headers.insert(
             "User-Agent",
-            HeaderValue::from_static("UURemote/4.42.0 (Windows NT 10.0; Win64; x64)"),
+            HeaderValue::from_static("UURemote/4.45.0 (Windows NT 10.0; Win64; x64)"),
         );
         if !self.creds.token.is_empty() {
             if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", self.creds.token)) { headers.insert("Authorization", v); }
