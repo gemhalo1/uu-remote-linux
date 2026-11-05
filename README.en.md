@@ -77,6 +77,7 @@ Protocol strings and messages that come from the UU servers are shown as the ser
 | Mac shortcuts | **Recommended**: turn off 「使用 macOS 快捷键」 (use macOS shortcuts) in the Mac viewer's remote-window menu; then Cmd+C/V/A/F/X/Z work as on a Mac (Cmd+C/V become Ctrl+Shift+C/V in terminals) and Ctrl+C always interrupts. With the option on, the viewer sends Cmd as Ctrl: in a terminal Ctrl+V / Cmd+V paste, Ctrl+C interrupts, copy is Cmd+Shift+C (X11) |
 | Pointer shape | Remote cursor shape is mirrored to the viewer (X11) |
 | Clipboard | Two-way text sync; Wayland mobile IME text inputs use clipboard paste fallback (see below) |
+| Viewer annotation | Strokes drawn with 「批注」 (annotate) in the viewer's watch mode appear on the Linux screen and stream back to the viewer (X11, needs a compositing manager; the overlay lets clicks through); cleared when annotation is turned off or the viewer disconnects. Verified with the Mac viewer 4.42.0; mobile viewers untested |
 | Quality / frame rate / resolution | Auto, Original 20M, Ultra 8M, HD 2M, custom; 30/60/90/144 fps; on X11 a resolution choice changes the desktop resolution itself like the official Windows host (xrandr, adding the mode when missing; restored for "original" or on disconnect), `UU_DESKTOP_RESIZE=0` scales in the encoder instead; Wayland scales in the encoder |
 | Sound | System audio captured from PulseAudio / PipeWire and sent as Opus |
 | File transfer | Upload, download (including folders), create folder, rename, delete |
@@ -159,7 +160,7 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
-| Privacy screen on the host | Experimental, KDE Plasma Wayland (portal) only; off, picture and screen-off status labels verified with Mac 4.43.0; see [docs/privacy-screen.md](docs/privacy-screen.md) |
+| Privacy screen on the host | Experimental, KDE Plasma Wayland (portal) only; off, picture and screen-off status labels verified with Mac 4.43.0; `UU_PRIVACY_AUTO=picture` / `screen-off` enables it automatically on desktop connect; see [docs/privacy-screen.md](docs/privacy-screen.md) |
 | Microphone (viewer audio played on the host) | Not implemented (needs a virtual sound card) |
 | Plugins such as the WoW queue notifier | Not supported; the client is told that no plugins exist |
 | Linux login screen | The system login screen (before anyone logs in to the Linux desktop) cannot be controlled yet; use headless mode or a virtual desktop (see below). This is about the Linux login: **without a UU account** the host can now be used through remote assistance |
@@ -612,6 +613,10 @@ separate from the host `uuremote-server`; the default host build and behaviour a
 `libsdl2-2.0-0`) and the `ffmpeg` command; SDL desktop windows synchronize text clipboard directly on Wayland/X11 without extra clipboard tools; the terminal needs a local
 terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsdl2-dev`, then
 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`.
+
+Key combinations use the left/right modifier state attached to each SDL key event. Focus loss releases remote keys; after focus returns, the next non-modifier key restores any still-held Shift/Ctrl/Alt/Win (Command on Mac). This is built in, with no adapter or setting required.
+
+The viewer mirrors remote PNG pointer shapes (including text and window-resize cursors) with their hotspots. Leaving the remote picture or opening local controls restores the local arrow.
 
 SDL clipboard access reuses the desktop window to avoid temporary-window Dock churn on GNOME Wayland (#37).
 On niri, data-control-capable `wl-clipboard` is used instead, so synchronization does not require window focus.

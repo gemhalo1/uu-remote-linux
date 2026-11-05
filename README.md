@@ -66,6 +66,7 @@ UU_LANG=en uuremote-server
 | Mac 快捷键 | **推荐**：在 Mac 远控窗口菜单里关闭「使用 macOS 快捷键」，之后和在 Mac 上一样：Cmd+C/V/A/F/X/Z 是复制、粘贴、全选、查找、剪切、撤销（终端里 Cmd+C/V 自动变成 Ctrl+Shift+C/V），Ctrl+C 在终端里始终是中断。保持开启时，客户端会把 Cmd 和 Ctrl 都当成 Ctrl 发送：终端里 Ctrl+V / Cmd+V 自动转成粘贴，Ctrl+C 是中断，复制用 Cmd+Shift+C（X11） |
 | 鼠标指针样式 | 远端指针形状实时同步（X11） |
 | 剪贴板 | 双向文本同步；Wayland 手机输入法输入通过剪贴板兜底粘贴，见下文 |
+| 观看模式批注 | 控制端观看模式下开启「批注」后画的笔迹显示在 Linux 屏幕上，并随画面传回控制端（X11，需要合成器；覆盖层不拦截鼠标）；关闭批注或断开连接时清除。已用 Mac 控制端 4.42.0 实测，手机控制端未测 |
 | 画质 / 帧率 / 分辨率 | 自动、原画 20M、超清 8M、高清 2M、自定义；30/60/90/144 帧；X11 下切换分辨率会像官方 Windows 被控端一样真正修改桌面分辨率（xrandr，缺少该模式时自动添加；选「原始」或断开后恢复），`UU_DESKTOP_RESIZE=0` 改为仅由编码器缩放；Wayland 仍由编码器缩放 |
 | 声音 | 采集系统声音（PulseAudio / PipeWire），Opus 编码传到控制端 |
 | 文件传输 | 上传、下载（含文件夹）、新建文件夹、重命名、删除 |
@@ -140,7 +141,7 @@ niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通
 | 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；`inproc-av` 原生 NVENC 输出 H.264 High 4:4:4 / HEVC FRExt；VAAPI 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
-| 被控端防窥模式 | 实验性，仅 KDE Plasma Wayland（portal）；Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显，见 [docs/privacy-screen.md](docs/privacy-screen.md) |
+| 被控端防窥模式 | 实验性，仅 KDE Plasma Wayland（portal）；Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显；`UU_PRIVACY_AUTO=picture` / `screen-off` 可在桌面连接时自动开启，见 [docs/privacy-screen.md](docs/privacy-screen.md) |
 | 麦克风（控制端声音传到被控端） | 未实现（需要虚拟声卡） |
 | 魔兽世界排队提醒等插件 | 不支持，会明确告诉客户端「无插件」 |
 | Linux 系统登录界面 | 还不支持控制开机后的系统登录界面（还没有人登录 Linux 桌面时）；这种情况可以用无头模式或虚拟桌面（见下文）。注意：这里说的是 Linux 系统登录，**不登录 UU 账号**现在可以通过「远程协助」使用 |
@@ -534,6 +535,10 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 **获取**：Release 包从本版本起附带 `uuremote-viewer`（x86_64）。运行时需要 GTK3、SDL2（Ubuntu/Debian：`libsdl2-2.0-0`）和
 `ffmpeg` 命令；SDL 桌面窗口直接同步文本剪贴板（Wayland/X11），无需额外剪贴板工具；终端功能需要本机终端程序（可用 `TERMINAL` 指定）。
 从源码构建：`sudo apt install libsdl2-dev`，然后 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`。
+
+组合键使用 SDL 按键事件携带的左右修饰键状态；窗口失焦时释放远端按键，重新聚焦后的下一次普通按键会恢复仍按住的 Shift/Ctrl/Alt/Win（Mac 为 Command）。此行为内置，无需适配库或开关。
+
+控制端会同步远端以 PNG 发送的指针形状（如文本光标和窗口缩放箭头），并保留正确热点。离开远控画面或打开本地菜单时恢复本机箭头。
 
 SDL 剪贴板复用桌面窗口，避免 GNOME Wayland 上临时窗口引起的 Dock 跳动（#37）。niri 改用支持 data-control 的
 `wl-clipboard`，不需要桌面窗口保持焦点；其他 SDL 后端仅在桌面窗口获得焦点时同步。

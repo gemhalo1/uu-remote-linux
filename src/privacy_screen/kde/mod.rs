@@ -16,7 +16,7 @@ pub const NAME: &str = "kde";
 pub struct Kde;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
-struct Data { outputs: Vec<String>, #[serde(default)] devices: Vec<String> }
+struct Data { outputs: Vec<String>, #[serde(default)] devices: Vec<input::Device> }
 
 impl Kde {
     pub fn detected() -> bool {
@@ -47,6 +47,13 @@ fn cover(data: &Data) -> Result<[f64; 4], String> {
     if physical.len() != data.outputs.len() { return Err("physical outputs did not come back".into()); }
     let region = outputs::region(&layout, &virtual_name).ok_or("virtual output geometry")?;
     super::cover::show(wallpaper().as_deref(), &physical)?;
+    // The cover is a plain Wayland toplevel: GTK's skip-taskbar hint is X11-only, so without this
+    // the task manager shows it as an unidentified window with the theme's generic "wayland" icon.
+    // KWin lists a freshly mapped window asynchronously, so one more pass catches a late cover.
+    for pass in 0..2 {
+        if let Err(e) = kwin::hide_cover_from_taskbar() { log::warn!("Privacy cover taskbar: {e}"); break; }
+        if pass == 0 { std::thread::sleep(std::time::Duration::from_millis(200)); }
+    }
     Ok(region)
 }
 
@@ -77,8 +84,9 @@ impl Backend for Kde {
     fn leave(&self, data: &serde_json::Value) -> Result<(), String> {
         let data: Data = serde_json::from_value(data.clone()).map_err(|_| "invalid KDE recovery data")?;
         // KWin persists the device flag: a failure is returned (after restoring the outputs) so the
-        // controller keeps the recovery record and the guard for the next attempt.
-        let devices = input::set(&data.devices, true).map_err(|e| format!("enable input devices: {e}"));
+        // controller keeps the recovery record and the guard for the next attempt. A device that
+        // no longer exists is skipped, so a record replayed after a reboot cannot wedge recovery.
+        let devices = input::restore(&data.devices).map_err(|e| format!("enable input devices: {e}"));
         // Physical outputs first: switching back opens a monitor share, which needs them enabled.
         // The wait also matters: a share opened before KWin applies the mode got the virtual
         // output's geometry (seen live: 1920x1080 instead of the panel's 3072x1920).
