@@ -49,21 +49,80 @@ pub fn ffmpeg_root() -> Option<PathBuf> {
         .or_else(|| file().ok().flatten().and_then(|f| f.get("ffmpeg_root")).and_then(|v| v.as_str()).map(PathBuf::from))
 }
 
-/// Reported client version (x-param-vn and User-Agent).
-/// Defaults to matching modern official Windows client (4.45.0.4318).
-/// Can be overridden via UU_CLIENT_VERSION or config "client_version".
-pub fn client_version() -> String {
-    std::env::var("UU_CLIENT_VERSION").ok().filter(|v| !v.is_empty())
-        .or_else(|| file().ok().flatten().and_then(|f| f.get("client_version")).and_then(|v| v.as_str()).map(str::to_owned))
-        .unwrap_or_else(|| "4.45.0.4318".into())
+/// Where the reported client version comes from, for `doctor` (a name, never a secret).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VersionSource { Default, Config, Environment }
+
+impl VersionSource {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Default => "default", Self::Config => "config", Self::Environment => "environment" }
+    }
 }
 
-/// Reported client version code (x-param-vc).
-/// Defaults to matching modern official Windows client (4318).
-/// Can be overridden via UU_VERSION_CODE or config "version_code".
+/// Trimmed non-empty environment variable, so `UU_CLIENT_VERSION=""` means unset.
+fn env_override(key: &str) -> Option<String> {
+    std::env::var(key).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+/// Trimmed non-empty string from the config file.
+fn config_override(key: &str) -> Option<String> {
+    file().ok().flatten().and_then(|f| f.get(key)).and_then(|v| v.as_str())
+        .map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned)
+}
+
+/// Reported client version (x-param-vn and User-Agent).
+/// Defaults to matching modern official Windows client (4.45.0.4318).
+/// `UU_CLIENT_VERSION` (also set by `--client-version`) wins over config "client_version".
+pub fn client_version() -> String {
+    client_version_with_source().0
+}
+
+/// `client_version()` plus where the value came from.
+pub fn client_version_with_source() -> (String, VersionSource) {
+    if let Some(v) = env_override("UU_CLIENT_VERSION") { return (v, VersionSource::Environment); }
+    if let Some(v) = config_override("client_version") { return (v, VersionSource::Config); }
+    ("4.45.0.4318".into(), VersionSource::Default)
+}
+
+/// Reported client version code (x-param-vc). An explicit `UU_VERSION_CODE` or config
+/// "version_code" wins; otherwise it is the trailing component of the reported version, so a
+/// version override cannot leave the pair mismatched (4.45.0.4318 -> 4318).
 pub fn version_code() -> String {
-    std::env::var("UU_VERSION_CODE").ok().filter(|v| !v.is_empty())
-        .or_else(|| file().ok().flatten().and_then(|f| f.get("version_code")).and_then(|v| v.as_str()).map(str::to_owned))
-        .unwrap_or_else(|| "4318".into())
+    version_code_with_source().0
+}
+
+/// `version_code()` plus where the value came from. A derived code reports the version's source.
+pub fn version_code_with_source() -> (String, VersionSource) {
+    if let Some(v) = env_override("UU_VERSION_CODE") { return (v, VersionSource::Environment); }
+    if let Some(v) = config_override("version_code") { return (v, VersionSource::Config); }
+    let (version, source) = client_version_with_source();
+    (derive_version_code(&version).unwrap_or_else(|| "4318".into()), source)
+}
+
+/// Trailing dot-separated component when it is all digits ("4.45.0.4318" -> "4318").
+fn derive_version_code(version: &str) -> Option<String> {
+    let last = version.rsplit('.').next()?.trim();
+    (!last.is_empty() && last.bytes().all(|b| b.is_ascii_digit())).then(|| last.to_owned())
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn version_code_is_the_trailing_build_number() {
+        assert_eq!(derive_version_code("4.45.0.4318").as_deref(), Some("4318"));
+        assert_eq!(derive_version_code("4.42.0.2770").as_deref(), Some("2770"));
+        assert_eq!(derive_version_code("4.45.0").as_deref(), Some("0"));
+        assert_eq!(derive_version_code("4.45").as_deref(), Some("45"));
+        assert_eq!(derive_version_code("4.45.0-beta"), None);
+        assert_eq!(derive_version_code(""), None);
+    }
+
+    #[test]
+    fn source_names_are_stable_for_doctor() {
+        assert_eq!(VersionSource::Default.as_str(), "default");
+        assert_eq!(VersionSource::Config.as_str(), "config");
+        assert_eq!(VersionSource::Environment.as_str(), "environment");
+    }
 }
 

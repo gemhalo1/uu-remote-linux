@@ -68,6 +68,13 @@ pub async fn run() -> Result<(), String> {
         ("engine-plugins", cfg!(feature = "engine-plugins")), ("inproc-av", cfg!(feature = "inproc-av"))]
         .into_iter().filter(|(_, on)| *on).map(|(name, _)| name).collect();
     line("build features", if features.is_empty() { "default (X11 only)".to_owned() } else { features.join(", ") });
+    // The official client version the host reports to the cloud; too old makes the viewer ask it
+    // to upgrade. Names only: no ids or tokens.
+    let (client_version, version_source) = crate::config::client_version_with_source();
+    let (version_code, code_source) = crate::config::version_code_with_source();
+    let source = if version_source == code_source { version_source.as_str().to_owned() }
+        else { format!("{}/{}", version_source.as_str(), code_source.as_str()) };
+    line("client version", format!("{client_version} (vc {version_code}, {source})"));
 
     println!("-- session");
     line("XDG_SESSION_TYPE", std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unset".into()));

@@ -216,6 +216,18 @@ pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
 const SUBCOMMANDS: [&str; 20] = ["privacy-guard", "privacy-wallpaper", "privacy-screen-probe", "doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
     "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
 
+/// The `--client-version VALUE` flag wherever it appears: returns the trimmed value and the
+/// argument list without the flag (input for the re-exec in `main`). `Err` means the flag is
+/// present without a usable value: exit 2, never start a second host.
+pub(crate) fn client_version_flag(args: &[String]) -> Result<Option<(String, Vec<String>)>, ()> {
+    let Some(pos) = args.iter().position(|a| a == "--client-version") else { return Ok(None); };
+    let value = args.get(pos + 1).map_or("", |v| v.trim());
+    if value.is_empty() { return Err(()); }
+    let mut rest = args.to_vec();
+    rest.drain(pos..pos + 2);
+    Ok(Some((value.to_owned(), rest)))
+}
+
 /// Unknown arguments and illegal set-encoder / set-codec values exit 2 (never start a second host).
 /// help / -h / --help exit 0 so main prints usage instead of starting the host.
 pub(crate) fn reject_cli(arg: Option<&str>, argc: usize, value_ok: bool) -> Option<i32> {
@@ -248,6 +260,20 @@ mod cli_exit_tests {
         assert!(super::cli_pref_ok("set-codec", "hevc"));
         assert_eq!(super::reject_cli(Some("set-encoder"), 3, super::cli_pref_ok("set-encoder", "")), Some(2));
         assert_eq!(super::reject_cli(Some("set-codec"), 3, super::cli_pref_ok("set-codec", "  ")), Some(2));
+    }
+
+    #[test]
+    fn client_version_flag_is_stripped_wherever_it_appears() {
+        let arg = |s: &str| s.to_owned();
+        assert_eq!(super::client_version_flag(&[arg("exe"), arg("--client-version"), arg("4.45.0.4318")]),
+            Ok(Some(("4.45.0.4318".to_owned(), vec![arg("exe")]))));
+        assert_eq!(super::client_version_flag(&[arg("exe"), arg("login"), arg("--client-version"), arg(" 4.45.0.4318 ")]),
+            Ok(Some(("4.45.0.4318".to_owned(), vec![arg("exe"), arg("login")]))));
+        assert_eq!(super::client_version_flag(&[arg("exe"), arg("--client-version"), arg("4.45.0.4318"), arg("doctor")]),
+            Ok(Some(("4.45.0.4318".to_owned(), vec![arg("exe"), arg("doctor")]))));
+        assert_eq!(super::client_version_flag(&[arg("exe"), arg("--client-version")]), Err(()));
+        assert_eq!(super::client_version_flag(&[arg("exe"), arg("--client-version"), arg("   ")]), Err(()));
+        assert_eq!(super::client_version_flag(&[arg("exe"), arg("login")]), Ok(None));
     }
 
     /// SIGUSR1 and SIGUSR2 are installed with no assist UI. `host.pid` is written only after both exist.
@@ -399,6 +425,26 @@ fn show_running_host() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // --client-version VERSION: the official client version the host simulates (x-param-vn).
+    // Strip the flag and re-exec so every argument check below sees the remaining arguments; the
+    // version travels as UU_CLIENT_VERSION, which auth reads per request (login and assist too).
+    {
+        let args: Vec<String> = std::env::args().collect();
+        match client_version_flag(&args) {
+            Ok(Some((value, rest))) => {
+                use std::os::unix::process::CommandExt;
+                // exec replaces the process on success; a returned error means it failed.
+                let error = std::process::Command::new("/proc/self/exe").args(&rest[1..])
+                    .env("UU_CLIENT_VERSION", value).exec();
+                return Err(format!("--client-version re-exec: {error}").into());
+            }
+            Ok(None) => {}
+            Err(()) => {
+                eprintln!("--client-version needs a non-empty value, e.g. 4.45.0.4318");
+                std::process::exit(2);
+            }
+        }
+    }
     // Not signed in, with a desktop: one window offers remote assistance (guest identity) and the QR
     // login together; signing in restarts the host in account mode (assistance continues there).
     let unified = std::env::args().nth(1).is_none() && display_present()
@@ -419,7 +465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => true,
     };
     if let Some(code) = reject_cli(arg1.as_deref(), std::env::args().len(), value_ok) {
-        let usage = format!("usage: uuremote-server [{}]\n  (no argument: run the host)", SUBCOMMANDS.join(" | "));
+        let usage = format!("usage: uuremote-server [--client-version VERSION] [{}]\n  (no argument: run the host)\n  --client-version VERSION: official client version to simulate, e.g. 4.45.0.4318 (also UU_CLIENT_VERSION)", SUBCOMMANDS.join(" | "));
         if code == 0 { println!("{usage}"); return Ok(()); }
         eprintln!("unknown argument\n{usage}");
         std::process::exit(code);
