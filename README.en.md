@@ -663,7 +663,9 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
   `UU_VIEWER_CLIPBOARD=0` the clipboard, `UU_VIEWER_VIEW_ONLY=1` input; `UU_VIEWER_FFMPEG` selects the ffmpeg binary.
 - Desktop offers H.264 / H.265; the host chooses the codec. `UU_VIEWER_CODEC=h264` limits both SDP and decoder capabilities to H.264.
   The default request stays 4:2:0; `UU_VIEWER_CHROMA=444` requests true color (4:4:4) after CONTROL opens. The host may fall back to
-  4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
+  4:2:0, as reported by CaptureSettingSync. Either chroma format is decoded to NV12 and converted on the GPU by SDL (no per-frame
+  swscale); decoding is multi-threaded by default, `UU_VIEWER_DECODE_THREADS=1` trades throughput for the lowest latency. See
+  [docs/viewer-performance.md](docs/viewer-performance.md) for measurements.
 - Frames are decoded at the host's native resolution and scaled to the window with linear filtering; a host resolution
   change restarts the decoder. `UU_VIEWER_SIZE=WxH` forces a fixed letterboxed canvas instead.
 

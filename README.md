@@ -578,7 +578,9 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
   `UU_VIEWER_VIEW_ONLY=1` 只看不控，`UU_VIEWER_FFMPEG` 指定 ffmpeg 路径。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
-  以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
+  以 CaptureSettingSync 回报为准。两种色度都解码成 NV12，由 SDL 交给 GPU 转色显示（不再每帧 swscale）；
+  解码默认按核数多线程，`UU_VIEWER_DECODE_THREADS=1` 可换最低延迟。分析与实测见
+  [docs/viewer-performance.md](docs/viewer-performance.md)。
 - 按被控端原始分辨率解码，窗口缩放使用线性过滤；被控端分辨率变化时自动重启解码器。`UU_VIEWER_SIZE=WxH` 可改为固定的留黑边画布。
 - 如果远控时触摸板自然滚动与本机方向相反，在远控窗口启用 **控制中心 → 外设 → 跟随本机自然滚动**。
   普通鼠标滚轮方向保持不变；触摸板的纵向、横向及精细自然滚动立即生效。选择记在 `~/.config/uuremote/viewer.json` 的 `follow_natural_scroll` 中（默认 `false`），下次连接自动沿用。

@@ -48,7 +48,9 @@ async fn websocket_control_ack_framing_heartbeat_failure_and_timeout() {
             ws.send(Message::Text("43999[\"success\",{}]".into())).await.unwrap();
             ws.send(Message::Text("4311[\"fail\",{}]".into())).await.unwrap();
         });
-        let mut signal=Signal::connect(&["invalid endpoint".into(),url],"synthetic-ticket",Duration::from_millis(100),legacy).await.unwrap();
+        // The whole handshake gets this budget; 100 ms was missed on a loaded 4-core box while the
+        // decoder tests run in parallel, so keep it generous. The short-timeout cases are below.
+        let mut signal=Signal::connect(&["invalid endpoint".into(),url],"synthetic-ticket",Duration::from_secs(2),legacy).await.unwrap();
         assert!(signal.control(json!({}),vec![8,1],Duration::from_secs(2)).await.unwrap_err().contains("refused"));signal.close().await;server.await.unwrap();
     }
     let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();let url=format!("ws://{}",listener.local_addr().unwrap());

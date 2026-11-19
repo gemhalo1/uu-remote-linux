@@ -1,17 +1,55 @@
 use super::media::Latest;
 use std::sync::{Arc, atomic::{AtomicBool,AtomicU32,Ordering}};
 #[derive(Clone)]
-pub struct Desktop { pub units:Latest<super::media::AccessUnit>, pub pli:Arc<AtomicBool>, pub reset:Arc<AtomicBool>, pub ssrc:Arc<AtomicU32> }
+pub struct Desktop { pub units:Latest<super::media::AccessUnit>, pub pli:Arc<AtomicBool>, pub reset:Arc<AtomicBool>, pub thin:Arc<AtomicBool>, pub ssrc:Arc<AtomicU32> }
 impl Default for Desktop {
-    fn default()->Self {Self{units:Latest::new(8),pli:Arc::new(AtomicBool::new(false)),reset:Arc::new(AtomicBool::new(false)),ssrc:Arc::new(AtomicU32::new(0))}}
+    fn default()->Self {Self{units:Latest::new(8),pli:Arc::new(AtomicBool::new(false)),reset:Arc::new(AtomicBool::new(false)),thin:Arc::new(AtomicBool::new(false)),ssrc:Arc::new(AtomicU32::new(0))}}
 }
-/// `content` is the source picture size inside the (possibly padded) RGB canvas; None = full frame.
-pub struct Frame { pub width:u32, pub height:u32, pub rgb:Vec<u8>, pub content:Option<(u32,u32)> }
+/// Pixel layout of a decoded picture. NV12 is what the ffmpeg CLI decoder writes: uploading it as
+/// an NV12 texture lets the renderer convert to RGB on the GPU and copies half the bytes per frame.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum Pixel { Rgb24, Nv12 }
+/// `content` is the source picture size inside the (possibly padded) canvas; None = full frame.
+pub struct Frame { pub width:u32, pub height:u32, pub data:Vec<u8>, pub pixel:Pixel, pub content:Option<(u32,u32)> }
+impl Frame {
+    /// RGB24 view of the picture. Only thumbnails, secure-input snapshots and the opt-in dumps
+    /// need RGB; the display path never converts.
+    pub fn to_rgb(&self)->std::borrow::Cow<'_,[u8]> {
+        match self.pixel {
+            Pixel::Rgb24=>std::borrow::Cow::Borrowed(&self.data),
+            Pixel::Nv12=>std::borrow::Cow::Owned(nv12_to_rgb(self.width,self.height,&self.data)),
+        }
+    }
+}
+/// BT.709 limited range (what the host's encoders tag for HD desktop streams).
+fn nv12_to_rgb(width:u32,height:u32,data:&[u8])->Vec<u8> {
+    let(w,h)=(width as usize,height as usize);
+    let luma=w*h;
+    if w==0 || h==0 || data.len()<luma+luma/2 {return Vec::new()}
+    let mut out=vec![0u8;luma*3];
+    for row in 0..h {
+        let yrow=&data[row*w..row*w+w];
+        let uvrow=((row/2)*w).min(data.len()-w);let uv=&data[luma+uvrow..];
+        for x in 0..w {
+            let c=x&!1;
+            let(y,u,v)=(i32::from(yrow[x])-16,i32::from(uv.get(c).copied().unwrap_or(128))-128,i32::from(uv.get(c+1).copied().unwrap_or(128))-128);
+            let l=y*298+128;
+            for (k,p) in [l+459*v,l-55*u-136*v,l+541*u].into_iter().enumerate() {
+                out[(row*w+x)*3+k]=(p>>8).clamp(0,255) as u8;
+            }
+        }
+    }
+    out
+}
 pub trait Decoder { fn set_codec(&mut self,codec:super::media::Codec)->Result<(),String>; fn decode(&mut self, au:&[u8])->Result<Vec<Frame>,String>; fn reset(&mut self);
     /// Frames finished since the last call, without new input; an asynchronous decoder
     /// returns a picture here instead of holding it until the next access unit arrives.
-    fn poll(&mut self)->Vec<Frame> {Vec::new()} }
-pub trait FrameSink { fn present(&mut self,frame:&Frame)->Result<(),String>; }
+    fn poll(&mut self)->Vec<Frame> {Vec::new()}
+    /// True once when the decoder dropped input on its own (it fell behind the stream) and the host
+    /// should send a key frame sooner; reading it clears the request. The decode loop turns it into
+    /// a PLI, which travels the same path as every other key-frame request.
+    fn needs_key_frame(&mut self)->bool {false} }
+pub trait FrameSink { fn present(&mut self,frame:Arc<Frame>)->Result<(),String>; }
 /// Counts only (access units, presented frames, decode errors) for the periodic stats line.
 pub static STATS:[std::sync::atomic::AtomicU64;3]=[std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0)];
 fn wants_key_frame(units:u64,presented:u64)->bool {presented==0 && units%30==0}
@@ -51,13 +89,13 @@ impl KeyGate {
         } else {false}
     }
 }
-fn present(sink:&mut dyn FrameSink,frame:&Frame)->Result<(),String> {
-    sink.present(frame)?;
+fn present(sink:&mut dyn FrameSink,frame:Frame)->Result<(),String> {
     // Local acceptance aid: UU_VIEWER_DUMP_FRAME=path writes the 5th frame as PPM (owner's own screen).
     if STATS[1].fetch_add(1,Ordering::Relaxed)==std::env::var("UU_VIEWER_DUMP_FRAME_INDEX").ok().and_then(|v|v.parse().ok()).unwrap_or(4u64) { if let Some(path)=std::env::var_os("UU_VIEWER_DUMP_FRAME") {
-        let mut ppm=format!("P6\n{} {}\n255\n",frame.width,frame.height).into_bytes();ppm.extend_from_slice(&frame.rgb);let _=std::fs::write(path,ppm);
+        let mut ppm=format!("P6\n{} {}\n255\n",frame.width,frame.height).into_bytes();ppm.extend_from_slice(&frame.to_rgb());let _=std::fs::write(path,ppm);
     }}
-    Ok(())
+    // The sink keeps the picture for window repaints, so hand it over without a copy.
+    sink.present(Arc::new(frame))
 }
 fn decode(decoder:&mut dyn Decoder,au:&[u8],codec:super::media::Codec,pli:&AtomicBool)->Vec<Frame> {
     let units=STATS[0].fetch_add(1,Ordering::Relaxed)+1;
@@ -71,7 +109,11 @@ fn decode(decoder:&mut dyn Decoder,au:&[u8],codec:super::media::Codec,pli:&Atomi
         use std::io::Write; if let Ok(mut f)=std::fs::OpenOptions::new().create(true).append(true).open(path){let _=f.write_all(au);}
     }}
     match decoder.decode(au) {
-        Ok(frames)=>frames,
+        Ok(frames)=>{
+            // The decoder skipped input itself: ask for the key frame its next unit needs.
+            if decoder.needs_key_frame() {pli.store(true,Ordering::Release);}
+            frames
+        }
         Err(_)=>{STATS[2].fetch_add(1,Ordering::Relaxed);decoder.reset();pli.store(true,Ordering::Release);Vec::new()},
     }
 }
@@ -85,6 +127,11 @@ fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn Fra
     for _ in 0..8 {
         let Some(au)=desktop.units.pop() else {break};
         if desktop.reset.swap(false,Ordering::AcqRel) {decoder.reset();gate.arm();}
+        // A newer picture pushed out an older access unit (only a decoder slower than the stream can
+        // cause this). Decode no further non-key units: they reference the gap and would smear until
+        // the next IDR. The decoder itself is kept, since restarting it would wait for a key frame to
+        // arrive; the RTP reader's already rate-limited PLI asks the host for one sooner.
+        if desktop.thin.swap(false,Ordering::AcqRel) {gate.arm();}
         if !gate.admit(au.codec,&au.data) {desktop.pli.store(true,Ordering::Release);}
         else {
             decoder.set_codec(au.codec)?;codec=Some(au.codec);
@@ -95,7 +142,7 @@ fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn Fra
     }
     // Asynchronous decoders may finish a picture even when no new input has arrived.
     if let Some(frame)=decoder.poll().pop() {newest=Some(frame);}
-    if let Some(frame)=newest {present(sink,&frame)?;}
+    if let Some(frame)=newest {present(sink,frame)?;}
     Ok(codec)
 }
 #[cfg(test)] mod tests {
@@ -120,11 +167,39 @@ fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn Fra
         g.limit=std::time::Duration::ZERO;g.arm();assert!(g.admit(Codec::H264,&p));
     }
     use super::*;
-    struct Mock(bool);impl Decoder for Mock {fn set_codec(&mut self,_:crate::viewer::media::Codec)->Result<(),String>{Ok(())} fn decode(&mut self,_:&[u8])->Result<Vec<Frame>,String>{if self.0{Err("synthetic".into())}else{Ok(vec![Frame{width:1,height:1,rgb:vec![0;3],content:None}])}} fn reset(&mut self){self.0=false;}}
-    struct Sink(usize);impl FrameSink for Sink{fn present(&mut self,f:&Frame)->Result<(),String>{assert_eq!(f.rgb.len(),3);self.0+=1;Ok(())}}
+    struct Mock(bool);impl Decoder for Mock {fn set_codec(&mut self,_:crate::viewer::media::Codec)->Result<(),String>{Ok(())} fn decode(&mut self,_:&[u8])->Result<Vec<Frame>,String>{if self.0{Err("synthetic".into())}else{Ok(vec![Frame{width:1,height:1,data:vec![0;3],pixel:Pixel::Rgb24,content:None}])}} fn reset(&mut self){self.0=false;}}
+    struct Sink(usize);impl FrameSink for Sink{fn present(&mut self,f:Arc<Frame>)->Result<(),String>{assert_eq!(f.data.len(),3);self.0+=1;Ok(())}}
     #[test] fn requests_key_frames_until_the_first_frame(){
         assert_eq!((1..=90).filter(|&n|wants_key_frame(n,0)).count(),3);
         assert!(!(1..=90).any(|n|wants_key_frame(n,1)));
+    }
+    #[test] fn nv12_converts_to_rgb(){
+        // BT.709 limited-range red as NV12: Y=63, Cb=102, Cr=240 (2x2, one shared chroma sample).
+        let frame=Frame{width:2,height:2,data:vec![63,63,63,63,102,240,102,240],pixel:Pixel::Nv12,content:None};
+        let rgb=frame.to_rgb();
+        assert_eq!(rgb.len(),12);
+        for p in rgb.chunks_exact(3) {assert!(p[0]>=250 && p[1]<=4 && p[2]<=4,"{p:?}");}
+        // Neutral grey stays neutral and a cropped buffer does not panic.
+        let grey=Frame{width:2,height:2,data:vec![126;4].into_iter().chain([128,128,128,128]).collect(),pixel:Pixel::Nv12,content:None};
+        for p in grey.to_rgb().chunks_exact(3) {assert!((125..=131).contains(&p[0]),"{p:?}");}
+        assert_eq!(Frame{width:2,height:2,data:vec![0;2],pixel:Pixel::Nv12,content:None}.to_rgb().len(),0);
+    }
+    #[test] fn rgb_frames_are_not_converted(){
+        let frame=Frame{width:1,height:1,data:vec![1,2,3],pixel:Pixel::Rgb24,content:None};
+        assert!(matches!(frame.to_rgb(),std::borrow::Cow::Borrowed(_)));
+    }
+    #[test] fn a_decoder_that_dropped_input_requests_a_key_frame(){
+        struct Behind(bool);
+        impl Decoder for Behind {
+            fn set_codec(&mut self,_:crate::viewer::media::Codec)->Result<(),String>{Ok(())}
+            fn decode(&mut self,_:&[u8])->Result<Vec<Frame>,String>{Ok(Vec::new())}
+            fn reset(&mut self){}
+            fn needs_key_frame(&mut self)->bool{std::mem::take(&mut self.0)}
+        }
+        let desktop=Desktop::default();let mut d=Behind(true);let mut s=Sink(0);let mut gate=KeyGate::new();
+        enqueue(&desktop,unit(0,false));
+        pump_with_elapsed(&desktop,&mut d,&mut s,&mut gate,||Duration::ZERO).unwrap();
+        assert!(desktop.pli.load(Ordering::Acquire));assert!(!d.needs_key_frame());
     }
     #[test] fn decode_error_requests_pli_and_recovers(){
         let desktop=Desktop::default();let mut d=Mock(true);let mut s=Sink(0);let mut gate=KeyGate::new();
@@ -140,7 +215,7 @@ fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn Fra
         let mut data=vec![0,0,0,1,if key {0x65}else{0x41},0b1001_1000];
         data.extend_from_slice(&id.to_le_bytes());AccessUnit{codec:Codec::H264,data}
     }
-    fn picture(id:u32)->Frame {Frame{width:1,height:1,rgb:id.to_le_bytes()[..3].to_vec(),content:None}}
+    fn picture(id:u32)->Frame {Frame{width:1,height:1,data:id.to_le_bytes()[..3].to_vec(),pixel:Pixel::Rgb24,content:None}}
     #[derive(Default)]
     struct BatchDecoder {seen:Vec<u32>,resets:usize,pending:Vec<Frame>,extra_picture:bool}
     impl Decoder for BatchDecoder {
@@ -155,12 +230,12 @@ fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn Fra
     #[derive(Default)]
     struct Pictures(Vec<u32>);
     impl FrameSink for Pictures {
-        fn present(&mut self,frame:&Frame)->Result<(),String>{assert_eq!(frame.rgb.len(),3);self.0.push(u32::from_le_bytes([frame.rgb[0],frame.rgb[1],frame.rgb[2],0]));Ok(())}
+        fn present(&mut self,frame:Arc<Frame>)->Result<(),String>{assert_eq!(frame.data.len(),3);self.0.push(u32::from_le_bytes([frame.data[0],frame.data[1],frame.data[2],0]));Ok(())}
     }
     // Match the RTP reader's overflow signal without a network or wall-clock sleeps.
     fn enqueue(desktop:&Desktop,au:AccessUnit)->bool {
         let dropped=desktop.units.push(au);
-        if dropped {desktop.reset.store(true,Ordering::Release);desktop.pli.store(true,Ordering::Release);}
+        if dropped {desktop.thin.store(true,Ordering::Release);desktop.pli.store(true,Ordering::Release);}
         dropped
     }
     #[test] fn one_unit_per_tick_overflows_even_with_a_larger_queue(){
@@ -199,15 +274,17 @@ fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn Fra
         enqueue(&desktop,unit(105,false));d.pending=vec![picture(206)];
         pump_with_elapsed(&desktop,&mut d,&mut s,&mut gate,||Duration::ZERO).unwrap();assert_eq!(s.0,vec![102,104,206]);
     }
-    #[test] fn actual_queue_loss_still_resets_and_waits_for_a_key_frame(){
+    #[test] fn actual_queue_loss_thins_to_a_key_frame_without_restarting_the_decoder(){
         let desktop=Desktop::default();let mut d=BatchDecoder::default();let mut s=Pictures::default();let mut gate=KeyGate::new();
         for id in 0..8 {assert!(!enqueue(&desktop,unit(id,false)));}
         assert!(enqueue(&desktop,unit(8,false)));
         pump_with_elapsed(&desktop,&mut d,&mut s,&mut gate,||Duration::ZERO).unwrap();
-        assert_eq!(d.resets,1);assert!(d.seen.is_empty());assert!(s.0.is_empty());assert!(desktop.pli.load(Ordering::Acquire));
+        // The oldest unit (0) was pushed out and everything up to the next key frame is skipped: the
+        // decoder keeps its reference pictures instead of being restarted.
+        assert_eq!(d.resets,0);assert!(d.seen.is_empty());assert!(s.0.is_empty());assert!(desktop.pli.load(Ordering::Acquire));
         enqueue(&desktop,unit(9,false));enqueue(&desktop,unit(10,true));enqueue(&desktop,unit(11,false));
         pump_with_elapsed(&desktop,&mut d,&mut s,&mut gate,||Duration::ZERO).unwrap();
-        assert_eq!(d.resets,1);assert_eq!(d.seen,vec![10,11]);assert_eq!(s.0,vec![11]);
+        assert_eq!(d.resets,0);assert_eq!(d.seen,vec![10,11]);assert_eq!(s.0,vec![11]);
     }
     #[test] fn batch_count_limit_leaves_remaining_units_for_the_next_tick(){
         let desktop=Desktop{units:Latest::new(12),..Default::default()};let mut d=BatchDecoder::default();let mut s=Pictures::default();let mut gate=KeyGate::new();

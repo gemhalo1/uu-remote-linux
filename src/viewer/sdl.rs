@@ -1,9 +1,17 @@
 use super::{desktop::{Frame,FrameSink},input::{Input,Viewport},session::Session};
 use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum,rect::Rect};
+use std::sync::Arc;
 #[derive(Debug)] enum Command { Files, Type }
-pub struct Window {cursor:super::cursor::Display,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
+pub struct Window {
+    // Declared before `canvas` so they are destroyed first: the textures borrow that renderer.
+    texture:Option<TextureCache>, hud:Option<TextureCache>,
+    cursor:super::cursor::Display,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest>,
-    pub last_frame:Option<Frame>, chrome:Chrome }
+    pub last_frame:Option<Arc<Frame>>, chrome:Chrome }
+/// The streaming texture is reused across frames: creating one per frame cost 41 ms at 4K on the
+/// GL renderer (measured), the upload alone 5.8 ms. `'static` is a lifetime lie the borrow checker
+/// cannot express without a self-referential struct; `Window` drops this field before the canvas.
+struct TextureCache { width:u32, height:u32, format:PixelFormatEnum, texture:sdl2::render::Texture<'static> }
 /// In-window chrome state (src/viewer/hud.rs): menu, network panel, loading screen.
 struct Chrome { font:Option<ab_glyph::FontVec>, scale:f32, pub state:hud::State, menu:hud::Menu, net:Option<hud::NetStats>, tab_hover:bool, tab_down:bool,
     commands:Vec<hud::Command>, started:std::time::Instant, last_loading:std::time::Instant, title:String, stage:String, labels:std::collections::HashMap<(String,u32,u32),hud::Layer>,
@@ -32,7 +40,7 @@ impl Window {
             title:crate::tr!("正在连接 {name}","Connecting to {name}"),stage:crate::i18n::s("正在连接远端设备…","Contacting the remote device…").into(),labels:Default::default(),menu_cache:None};
         let events=sdl.event_pump()?;let clipboard=video.clipboard();
         let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
-        Ok(Self{cursor:super::cursor::Display::new(),canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
+        Ok(Self{texture:None,hud:None,cursor:super::cursor::Display::new(),canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
     }
     pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone())}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
@@ -205,11 +213,20 @@ impl Window {
         else {self.loading_frame(true);}
     }
     fn blit(&mut self,layer:&hud::Layer,x:i32,y:i32)->Result<(),String>{
-        let creator=self.canvas.texture_creator();
-        let mut t=creator.create_texture_streaming(PixelFormatEnum::RGBA32,layer.w,layer.h).map_err(|_|"Texture creation failed")?;
-        t.set_blend_mode(sdl2::render::BlendMode::Blend);
-        t.update(None,&layer.px,layer.w as usize*4).map_err(|_|"Texture update failed")?;
-        self.canvas.copy(&t,None,Some(Rect::new(x,y,layer.w,layer.h)))
+        // Same reuse and lifetime argument as `upload`; HUD layers change size between the tab,
+        // the menu and the stats panel, so a size change rebuilds it.
+        if !self.hud.as_ref().is_some_and(|t|(t.width,t.height)==(layer.w,layer.h)) {
+            let creator=self.canvas.texture_creator();
+            let created=creator.create_texture_streaming(PixelFormatEnum::RGBA32,layer.w,layer.h).map_err(|_|"Texture creation failed")?;
+            // SAFETY: dropped with `self.hud`, declared before `canvas`.
+            let texture:sdl2::render::Texture<'static>=unsafe{std::mem::transmute(created)};
+            drop(creator);
+            self.hud=Some(TextureCache{width:layer.w,height:layer.h,format:PixelFormatEnum::RGBA32,texture});
+        }
+        let cache=self.hud.as_mut().ok_or("Texture missing")?;
+        cache.texture.set_blend_mode(sdl2::render::BlendMode::Blend);
+        cache.texture.update(None,&layer.px,layer.w as usize*4).map_err(|_|"Texture update failed".to_string())?;
+        self.canvas.copy(&cache.texture,None,Some(Rect::new(x,y,layer.w,layer.h))).map_err(|e|e.to_string())
     }
     fn label(&mut self,text:&str,size:f32,color:hud::Rgba)->hud::Layer{
         let key=(text.to_owned(),size.to_bits(),u32::from_le_bytes(color));
@@ -264,18 +281,35 @@ impl Window {
         if self.chrome.menu.open||self.tab_visible() {let _=self.draw_chrome();}
         self.canvas.present();
     }
+    /// Uploads `frame` into the cached streaming texture, converting nothing on the CPU: NV12
+    /// pictures go to the GPU as-is and the renderer turns them into RGB.
+    fn upload(&mut self,frame:&Frame)->Result<(),String>{
+        let format=match frame.pixel {super::desktop::Pixel::Nv12=>PixelFormatEnum::NV12,super::desktop::Pixel::Rgb24=>PixelFormatEnum::RGB24};
+        let reuse=self.texture.as_ref().is_some_and(|t|(t.width,t.height,t.format)==(frame.width,frame.height,format));
+        if !reuse {
+            let creator=self.canvas.texture_creator();
+            let created=creator.create_texture_streaming(format,frame.width,frame.height).map_err(|_|"Texture creation failed")?;
+            // SAFETY: the texture only carries a borrow marker for the texture creator; it is dropped
+            // with `self.texture`, which is declared before `canvas` and therefore dropped first.
+            let texture: sdl2::render::Texture<'static> = unsafe { std::mem::transmute(created) };
+            drop(creator);
+            self.texture=Some(TextureCache{width:frame.width,height:frame.height,format,texture});
+        }
+        let Some(cache)=self.texture.as_mut() else {return Err("Texture missing".into())};
+        let pitch=frame.width as usize*match format {PixelFormatEnum::NV12=>1,_=>3};
+        cache.texture.update(None,&frame.data,pitch).map_err(|_|"Texture update failed".to_string())
+    }
     fn draw(&mut self,frame:&Frame)->Result<(),String>{
         // Pad bars belong to the decoded canvas, not the remote picture: viewport and input use the
         // content aspect, and only the content sub-rectangle of the texture is drawn.
         let content=frame.content.unwrap_or((frame.width,frame.height));
-        self.frame=content;let v=self.viewport();let creator=self.canvas.texture_creator();
-        let mut texture=creator.create_texture_streaming(PixelFormatEnum::RGB24,frame.width,frame.height).map_err(|_|"Texture creation failed")?;
-        texture.update(None,&frame.rgb,frame.width as usize*3).map_err(|_|"Texture update failed")?;
+        self.frame=content;self.upload(frame)?;let v=self.viewport();
         self.canvas.set_draw_color(sdl2::pixels::Color::BLACK);self.canvas.clear();
         let src=super::input::content_rect((frame.width,frame.height),content)
             .map(|(x,y,w,h)|Rect::new(x.round() as i32,y.round() as i32,w.round().max(1.) as u32,h.round().max(1.) as u32));
-        self.canvas.copy(&texture,src,Some(Rect::new(v.x.round() as i32,v.y.round() as i32,v.width.round().max(1.) as u32,v.height.round().max(1.) as u32)))?;
-        drop(texture);self.draw_chrome()?;self.canvas.present();Ok(())
+        let texture=&self.texture.as_ref().ok_or("Texture missing")?.texture;
+        self.canvas.copy(texture,src,Some(Rect::new(v.x.round() as i32,v.y.round() as i32,v.width.round().max(1.) as u32,v.height.round().max(1.) as u32)))?;
+        self.draw_chrome()?;self.canvas.present();Ok(())
     }
 }
 /// On Wayland SDL draws its title bar through libdecor; the GTK plugin calls GTK3 from SDL's thread
@@ -403,9 +437,10 @@ fn needs_redraw(event:&Event)->bool{
 }
 fn button(b:MouseButton)->Option<i32>{match b{MouseButton::Left=>Some(1),MouseButton::Right=>Some(2),MouseButton::Middle=>Some(16),_=>None}}
 impl FrameSink for Window {
-    fn present(&mut self,frame:&Frame)->Result<(),String>{
-        self.last_frame=Some(Frame{width:frame.width,height:frame.height,rgb:frame.rgb.clone(),content:frame.content});
-        self.draw(frame)
+    fn present(&mut self,frame:Arc<Frame>)->Result<(),String>{
+        // Keep the Arc for window repaints: no copy of a 4K picture (25 MB) per presented frame.
+        self.last_frame=Some(frame.clone());
+        self.draw(&frame)
     }
 }
 pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super::desktop::Decoder,view_only:bool,device:&str)->Result<(),String>{
@@ -714,7 +749,8 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             let mut snap = None;
             if let Some(path) = job.snapshot_path.clone() {
                 if let Some(frame) = window.last_frame.as_ref() {
-                    match super::type_ipc::write_png_rgb(&path, frame.width, frame.height, &frame.rgb, job.snapshot_create_new) {
+                    let rgb=frame.to_rgb();
+                    match super::type_ipc::write_png_rgb(&path, frame.width, frame.height, &rgb, job.snapshot_create_new) {
                         Ok(()) => {
                             log::info!("Secure input snapshot written: {}", path.display());
                             snap = Some(path.display().to_string());
@@ -829,7 +865,11 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         }
         let mut window=Window::new().unwrap();let scale=window.chrome.scale;
         window.canvas.window_mut().set_size((1280.*scale) as u32,(720.*scale) as u32).unwrap();
-        let frame=Frame{width:1280,height:720,rgb:[60,64,72].repeat(1280*720),content:None};
+        let frame=Frame{width:1280,height:720,data:[60,64,72].repeat(1280*720),pixel:crate::viewer::desktop::Pixel::Rgb24,content:None};
+        // NV12 is what the decoder produces: its upload, GPU color conversion and the cached
+        // texture must work here too, not only RGB24.
+        let nv12=Frame{width:1280,height:720,data:vec![120;1280*720*3/2],pixel:crate::viewer::desktop::Pixel::Nv12,content:None};
+        window.draw(&nv12).unwrap();assert_eq!(window.frame,(1280,720));
         window.chrome.menu.open=true;window.chrome.menu.category=1;
         window.draw(&frame).unwrap();
         let (_,layout)=window.menu_layout();let origin=window.menu_origin(&layout);

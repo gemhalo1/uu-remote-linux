@@ -40,7 +40,7 @@ pub fn save(device: &str, frame: &super::desktop::Frame) -> Result<(), String> {
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     let content = super::input::content_rect((frame.width, frame.height), frame.content.unwrap_or((frame.width, frame.height)))
         .map_or((0, 0, frame.width, frame.height), |(x, y, w, h)| (x as u32, y as u32, w as u32, h as u32));
-    let (w, h, rgb) = downscale(frame.width, frame.height, &frame.rgb, content, 640);
+    let (w, h, rgb) = downscale(frame.width, frame.height, &frame.to_rgb(), content, 640);
     // Write then rename, so the launcher never reads a half-written file.
     let tmp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&tmp);

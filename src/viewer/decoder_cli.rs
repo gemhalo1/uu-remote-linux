@@ -6,12 +6,20 @@
 use super::desktop::{Decoder,Frame};
 use super::media::Codec;
 use std::io::{BufRead,Read,Write};
-use std::process::{Child,ChildStdin,Command,Stdio};
+use std::process::{Child,Command,Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool,AtomicU64,Ordering};
 use std::sync::mpsc::{Receiver,TryRecvError};
 
-pub struct Cli { child:Child, input:Option<ChildStdin>, codec:Codec, frames:Receiver<(u32,u32,Vec<u8>)>, fixed:Option<(u32,u32)>, source:Arc<AtomicU64>, resized:Arc<AtomicBool> }
+pub struct Cli { child:Child, input:Option<std::sync::mpsc::SyncSender<Vec<u8>>>, codec:Codec, frames:Receiver<(u32,u32,Vec<u8>)>, fixed:Option<(u32,u32)>, source:Arc<AtomicU64>, resized:Arc<AtomicBool>, thin:bool, need_key:bool }
+
+/// Decoder threads: 0 lets ffmpeg use one thread per core (frame threading, which holds back
+/// `threads-1` pictures) instead of the single thread that capped 4K H.265 at ~21 fps.
+/// `UU_VIEWER_DECODE_THREADS=1` trades that throughput for the lowest latency.
+fn decode_threads()->String {
+    std::env::var("UU_VIEWER_DECODE_THREADS").ok()
+        .and_then(|v|v.trim().parse::<u32>().ok()).filter(|n|*n<=64).unwrap_or(0).to_string()
+}
 
 impl Cli {
     /// `UU_VIEWER_SIZE=WxH` scales into a fixed canvas (default: native size); `UU_VIEWER_FFMPEG` the binary.
@@ -26,16 +34,18 @@ impl Cli {
         let filter=fixed.map(|(width,height)|format!("scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"));
         let passthrough=passthrough_args(&ffmpeg);
         let mut command=Command::new(&ffmpeg);
-        command.args(["-hide_banner","-loglevel","verbose","-nostats","-nostdin","-threads","1","-probesize","32","-analyzeduration","0",
+        command.args(["-hide_banner","-loglevel","verbose","-nostats","-nostdin","-threads",&decode_threads(),"-probesize","32","-analyzeduration","0",
                 "-fflags","nobuffer","-flags","low_delay","-f",codec.demuxer(),"-i","pipe:0","-an"]);
         if let Some(filter)=&filter {command.args(["-vf",filter]);}
-        let mut child=command.args(["-pix_fmt","rgb24",
+        // NV12, not RGB: the renderer converts it on the GPU, so swscale stays out of the per-frame
+        // path and half the bytes cross the pipe (measured 4K: upload 25 → 5.8 ms/frame).
+        let mut child=command.args(["-pix_fmt","nv12",
                 // Raw H.264/H.265 carries no timestamps; constant-rate output dropped almost every frame of
                 // the official Mac host's stream (270 → 2). Pass frames through unchanged.
                 passthrough.0,passthrough.1,"-f","rawvideo","pipe:1"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
             .spawn().map_err(|e|format!("Start ffmpeg decoder: {e}"))?;
-        let input=child.stdin.take().ok_or("ffmpeg stdin missing")?;
+        let mut input=child.stdin.take().ok_or("ffmpeg stdin missing")?;
         let mut output=child.stdout.take().ok_or("ffmpeg stdout missing")?;
         // Source picture size from the one-time stream line; 0 until parsed. Only the numbers are kept.
         let source=Arc::new(AtomicU64::new(0));let resized=Arc::new(AtomicBool::new(false));
@@ -62,18 +72,24 @@ impl Cli {
                 }
             });
         }
+        // Feeding the decoder runs on its own thread: a slow decoder must not block the caller's
+        // event loop (measured 4K stalls of 75-144 ms per write at 60 fps input).
+        let (in_tx,in_rx)=std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        std::thread::Builder::new().name("uu-viewer-ffmpeg-in".into()).spawn(move||{
+            for data in in_rx {if input.write_all(&data).is_err() {break}}
+        }).map_err(|e|format!("Decoder writer: {e}"))?;
         // Bounded: a slow window drops decoded frames instead of growing memory.
         let (tx,frames)=std::sync::mpsc::sync_channel(2);
         std::thread::Builder::new().name("uu-viewer-decode".into()).spawn(move||{
             let Ok((width,height))=size_rx.recv() else {return};
-            let size=width as usize*height as usize*3;
+            let size=width as usize*height as usize*3/2;
             loop {
                 let mut frame=vec![0;size];
                 if output.read_exact(&mut frame).is_err() {break;}
                 match tx.try_send((width,height,frame)) { Ok(())|Err(std::sync::mpsc::TrySendError::Full(_))=>{}, Err(_)=>break }
             }
         }).map_err(|e|format!("Decoder reader: {e}"))?;
-        Ok(Self{child,input:Some(input),codec,frames,fixed,source,resized})
+        Ok(Self{child,input:Some(in_tx),codec,frames,fixed,source,resized,thin:false,need_key:false})
     }
 }
 
@@ -131,24 +147,38 @@ impl Decoder for Cli {
             *self=Self::with_codec(self.codec,self.fixed)?;
             return Err("remote resolution changed".into());
         }
-        let input=self.input.as_mut().ok_or("ffmpeg input closed")?;
+        let input=self.input.as_ref().ok_or("ffmpeg input closed")?;
+        // ffmpeg consumes its input at decode speed, so at 4K the two-unit queue fills whenever the
+        // remote sends faster than this machine decodes. Dropping a unit mid-GOP would smear the
+        // pictures that reference it, so skip ahead to the next key frame instead; the decoder keeps
+        // its reference pictures and resumes immediately at that key frame (no restart, no stall).
+        if self.thin {
+            if !super::desktop::is_key_frame(self.codec,au) {return Ok(Vec::new())}
+            self.thin=false;
+        }
         // The raw-stream parser ends an access unit only when the next one starts; an access unit
         // delimiter right after it releases the picture now instead of one remote frame later.
         let delimiter:&[u8]=match self.codec {Codec::H264=>&[0,0,0,1,0x09,0xf0],Codec::H265=>&[0,0,0,1,0x46,0x01,0x50]};
-        input.write_all(au).and_then(|_|input.write_all(delimiter)).and_then(|_|input.flush()).map_err(|_|"ffmpeg decoder exited")?;
+        let mut unit=Vec::with_capacity(au.len()+delimiter.len());unit.extend_from_slice(au);unit.extend_from_slice(delimiter);
+        match input.try_send(unit) {
+            Ok(())=>{},
+            Err(std::sync::mpsc::TrySendError::Full(_))=>{self.thin=true;self.need_key=true;return Ok(Vec::new())},
+            Err(std::sync::mpsc::TrySendError::Disconnected(_))=>return Err("ffmpeg decoder exited".into()),
+        }
         self.take_frames()
     }
     fn poll(&mut self)->Vec<Frame> {self.take_frames().unwrap_or_default()}
+    fn needs_key_frame(&mut self)->bool {std::mem::take(&mut self.need_key)}
 }
 impl Cli {
     fn take_frames(&mut self)->Result<Vec<Frame>,String> {
         let mut out=Vec::new();
         loop {
             match self.frames.try_recv() {
-                Ok((width,height,rgb))=>{
+                Ok((width,height,data))=>{
                     let source=self.source.load(Ordering::Relaxed);
                     let content=(self.fixed.is_some()&&source!=0).then(||((source>>32) as u32,source as u32));
-                    out.push(Frame{width,height,rgb,content})
+                    out.push(Frame{width,height,data,pixel:super::desktop::Pixel::Nv12,content})
                 },
                 Err(TryRecvError::Empty)=>break,
                 Err(TryRecvError::Disconnected)=>return Err("ffmpeg decoder exited".into()),
@@ -173,7 +203,7 @@ impl Drop for Cli { fn drop(&mut self) { let _=self.child.kill(); let _=self.chi
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
-    #[test] fn ffmpeg_decodes_h264_and_hevc_420_and_444_to_rgb24(){
+    #[test] fn ffmpeg_decodes_h264_and_hevc_420_and_444_to_nv12(){
         match Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status(){
             Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{eprintln!("skip: ffmpeg is not on PATH");return},
             result=>assert!(result.expect("ffmpeg availability").success()),
@@ -188,20 +218,20 @@ impl Drop for Cli { fn drop(&mut self) { let _=self.child.kill(); let _=self.chi
             (Codec::H265,&include_bytes!("../../tests/fixtures/viewer/red-444.hevc")[..]),
         ] {
             cli.set_codec(codec).unwrap();
-            // Exercise the same streaming process and RGB conversion as SDL, then drain at EOF.
+            // Exercise the same streaming process and NV12 output as SDL, then drain at EOF.
             let mut frames=cli.decode(data).unwrap();drop(cli.input.take());
             loop {match cli.frames.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok((width,height,rgb))=>frames.push(Frame{width,height,rgb,content:None}),
+                Ok((width,height,data))=>frames.push(Frame{width,height,data,pixel:super::super::desktop::Pixel::Nv12,content:None}),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
                 Err(e)=>panic!("{codec:?} decoder did not finish: {e}"),
             }}
             let status=cli.child.wait().unwrap();
             assert!(status.success(),"{codec:?}: ffmpeg exited with {status}");
-            assert!(!frames.is_empty(),"{codec:?}: no RGB frames");
+            assert!(!frames.is_empty(),"{codec:?}: no frames");
             for frame in frames {
-                assert_eq!(frame.rgb.len(),32*32*3);
+                assert_eq!(frame.data.len(),32*32*3/2);
                 assert_eq!((frame.width,frame.height),(32,32));
-                assert!(frame.rgb.chunks_exact(3).all(|p|p[0]>220 && p[1]<30 && p[2]<30),"{codec:?}: RGB conversion");
+                assert!(frame.to_rgb().chunks_exact(3).all(|p|p[0]>200 && p[1]<60 && p[2]<60),"{codec:?}: NV12 picture");
             }
         }
         }
